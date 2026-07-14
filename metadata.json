@@ -1,0 +1,8 @@
+{
+  "name": "Cloudflare Clean IP Scanner mobile app",
+  "description": "An Android-styled utility for testing and scanning Cloudflare clean IPs. It performs latency (ping) tests and speed measurements against custom VPN/proxy configurations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
