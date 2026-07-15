@@ -768,6 +768,757 @@ app.post("/api/scan/speed", async (req, res) => {
   }
 });
 
+// API Route: Fetch Inbounds from 3x-ui Panel
+app.post("/api/3x-ui/inbounds", async (req, res) => {
+  const { panelUrl, username, password, sessionCookie, apiToken } = req.body;
+
+  if (!panelUrl || (!sessionCookie && !apiToken && (!username || !password))) {
+    res.status(400).json({ error: "Missing required fields for authentication" });
+    return;
+  }
+
+  try {
+    let cleanUrl = panelUrl.trim();
+    if (cleanUrl.endsWith("/")) {
+      cleanUrl = cleanUrl.slice(0, -1);
+    }
+
+    let cookieString = "";
+    let isBearerAuth = false;
+
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+    if (apiToken && apiToken.trim()) {
+      isBearerAuth = true;
+    } else if (sessionCookie && sessionCookie.trim()) {
+      const trimmed = sessionCookie.trim();
+      cookieString = trimmed.includes("=") ? trimmed : `session=${trimmed}`;
+    } else {
+      let initCookies = "";
+      try {
+        const getResponse = await fetch(`${cleanUrl}/login`, {
+          method: "GET",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          }
+        });
+        const rawGetCookieHeader = getResponse.headers.get("set-cookie");
+        const getCookieHeaders = typeof getResponse.headers.getSetCookie === "function"
+          ? getResponse.headers.getSetCookie()
+          : (rawGetCookieHeader ? [rawGetCookieHeader] : []);
+        if (getCookieHeaders.length > 0) {
+          initCookies = getCookieHeaders.map(c => c.split(";")[0]).join("; ");
+        }
+      } catch (e) {}
+
+      let origin = "";
+      try {
+        origin = new URL(cleanUrl).origin;
+      } catch (e) {}
+
+      const headers: Record<string, string> = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Language": "fa,fa-IR;q=0.9,en-US;q=0.8,en;q=0.7"
+      };
+
+      const loginAttempts = [
+        {
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          getBody: () => {
+            const params = new URLSearchParams();
+            params.append("username", username || "");
+            params.append("password", password || "");
+            return params;
+          }
+        },
+        {
+          headers: { "Content-Type": "application/json" },
+          getBody: () => JSON.stringify({ username, password })
+        }
+      ];
+
+      let loginResponse = null;
+      for (const attempt of loginAttempts) {
+        try {
+          const attemptHeaders = { ...headers, ...attempt.headers };
+          if (origin) {
+            attemptHeaders["Origin"] = origin;
+            attemptHeaders["Referer"] = `${cleanUrl}/login`;
+          }
+          if (initCookies) {
+            attemptHeaders["Cookie"] = initCookies;
+          }
+          const resObj = await fetch(`${cleanUrl}/login`, {
+            method: "POST",
+            headers: attemptHeaders,
+            body: attempt.getBody() as any,
+            redirect: "manual"
+          });
+          if (resObj.status === 200 || resObj.status === 302) {
+            loginResponse = resObj;
+            break;
+          }
+        } catch (e) {}
+      }
+
+      if (!loginResponse) {
+        res.status(401).json({ error: "Failed to authenticate with panel during inbounds check" });
+        return;
+      }
+
+      const rawCookieHeader = loginResponse.headers.get("set-cookie");
+      const setCookieHeaders = typeof loginResponse.headers.getSetCookie === "function"
+        ? loginResponse.headers.getSetCookie()
+        : (rawCookieHeader ? [rawCookieHeader] : []);
+
+      if (setCookieHeaders.length > 0) {
+        cookieString = setCookieHeaders.map(c => c.split(";")[0]).join("; ");
+      } else if (initCookies) {
+        cookieString = initCookies;
+      } else {
+        res.status(401).json({ error: "No session cookie returned during inbounds check" });
+        return;
+      }
+    }
+
+    const inboundsPaths = [
+      "/panel/api/inbounds/list",
+      "/xui/API/inbounds/list",
+      "/xui/api/inbounds/list",
+      "/api/inbounds/list"
+    ];
+
+    const requestHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "X-Requested-With": "XMLHttpRequest"
+    };
+    if (isBearerAuth) {
+      requestHeaders["Authorization"] = `Bearer ${apiToken.trim()}`;
+    } else {
+      requestHeaders["Cookie"] = cookieString;
+    }
+
+    let inboundsData = null;
+    let successfulPath = "";
+
+    for (const path of inboundsPaths) {
+      let finalUrl = `${cleanUrl}${path}`;
+      try {
+        const parsedClean = new URL(cleanUrl);
+        const basePath = parsedClean.pathname;
+        if (basePath && basePath !== "/" && path.startsWith(basePath)) {
+          finalUrl = `${parsedClean.origin}${path}`;
+        }
+      } catch (e) {}
+
+      try {
+        const response = await fetch(finalUrl, {
+          method: "GET",
+          headers: requestHeaders
+        });
+
+        if (response.status === 200) {
+          const text = await response.text();
+          if (!text.trim().startsWith("<")) {
+            const json = JSON.parse(text);
+            if (json && json.success) {
+              inboundsData = json;
+              successfulPath = path;
+              break;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (!inboundsData) {
+      res.status(404).json({ error: "Could not fetch inbounds list from your panel. Please check your URL and permissions." });
+      return;
+    }
+
+    const list = Array.isArray(inboundsData.obj) ? inboundsData.obj : [];
+    const inbounds = list.map((item: any) => ({
+      id: item.id,
+      tag: item.tag,
+      port: item.port,
+      protocol: item.protocol,
+      remark: item.remark,
+      enable: item.enable
+    }));
+
+    res.json({
+      success: true,
+      inbounds,
+      path: successfulPath
+    });
+
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to retrieve inbounds" });
+  }
+});
+
+// API Route: Sync Hosts to 3x-ui Panel
+app.post("/api/3x-ui/sync-hosts", async (req, res) => {
+  const { panelUrl, username, password, sessionCookie, apiToken, hosts } = req.body;
+
+  if (!panelUrl || (!sessionCookie && !apiToken && (!username || !password)) || !Array.isArray(hosts) || hosts.length === 0) {
+    res.status(400).json({ error: "Missing required fields (Panel URL and either Session Cookie, API Token, or Username/Password) or empty hosts list" });
+    return;
+  }
+
+  try {
+    // 1. Clean panel URL (remove trailing slash)
+    let cleanUrl = panelUrl.trim();
+    if (cleanUrl.endsWith("/")) {
+      cleanUrl = cleanUrl.slice(0, -1);
+    }
+
+    let cookieString = "";
+    let isBearerAuth = false;
+
+    // Set environment variable to bypass self-signed certificate rejection
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+    // If the user provided an API Token, we use it directly and bypass login completely!
+    if (apiToken && apiToken.trim()) {
+      isBearerAuth = true;
+      console.log("Using API Token (Bearer Auth). Bypassing login phase.");
+    } else if (sessionCookie && sessionCookie.trim()) {
+      const trimmed = sessionCookie.trim();
+      cookieString = trimmed.includes("=") ? trimmed : `session=${trimmed}`;
+      console.log("Using user-provided direct session cookie. Bypassing login phase.");
+    } else {
+      // 2. Login to 3x-ui panel
+      // First, do a GET request to /login to establish session/cookies if required by reverse proxies or security modules
+      let initCookies = "";
+      try {
+        const getController = new AbortController();
+        const getTimeout = setTimeout(() => getController.abort(), 6000);
+        
+        const getResponse = await fetch(`${cleanUrl}/login`, {
+          method: "GET",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "fa,fa-IR;q=0.9,en-US;q=0.8,en;q=0.7"
+          },
+          signal: getController.signal
+        });
+
+        const rawGetCookieHeader = getResponse.headers.get("set-cookie");
+        const getCookieHeaders = typeof getResponse.headers.getSetCookie === "function"
+          ? getResponse.headers.getSetCookie()
+          : (rawGetCookieHeader ? [rawGetCookieHeader] : []);
+          
+        if (getCookieHeaders.length > 0) {
+          initCookies = getCookieHeaders.map(c => c.split(";")[0]).join("; ");
+        }
+        clearTimeout(getTimeout);
+      } catch (e) {
+        // Ignore initial GET failure and try to proceed with POST
+      }
+
+      // Extract origin and referer to bypass simple security policies & reverse proxies
+      let origin = "";
+      try {
+        const parsedUrl = new URL(cleanUrl);
+        origin = parsedUrl.origin;
+      } catch (e) {
+        // fallback
+      }
+
+      const headers: Record<string, string> = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "fa,fa-IR;q=0.9,en-US;q=0.8,en;q=0.7"
+      };
+
+      let loginResponse: any = null;
+      let lastLoginError: any = null;
+
+      // We will try 3 methods in sequence to log in:
+      // Method 1: Standard URL-Encoded Form Post (no X-Requested-With, mimicking a real browser form submit)
+      // Method 2: AJAX URL-Encoded Form Post (with X-Requested-With: XMLHttpRequest)
+      // Method 3: JSON Payload ({"username": "...", "password": "..."})
+
+      const loginAttempts = [
+        {
+          name: "Standard URL-Encoded Form",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+          },
+          getBody: () => {
+            const params = new URLSearchParams();
+            params.append("username", username || "");
+            params.append("password", password || "");
+            return params;
+          }
+        },
+        {
+          name: "AJAX URL-Encoded Form",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          getBody: () => {
+            const params = new URLSearchParams();
+            params.append("username", username || "");
+            params.append("password", password || "");
+            return params;
+          }
+        },
+        {
+          name: "JSON Payload",
+          headers: {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*"
+          },
+          getBody: () => JSON.stringify({ username, password })
+        }
+      ];
+
+      for (let i = 0; i < loginAttempts.length; i++) {
+        const attempt = loginAttempts[i];
+        const attemptHeaders: Record<string, string> = { ...headers, ...attempt.headers };
+        
+        if (origin) {
+          attemptHeaders["Origin"] = origin;
+          attemptHeaders["Referer"] = `${cleanUrl}/login`;
+        }
+        if (initCookies) {
+          attemptHeaders["Cookie"] = initCookies;
+        }
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000); // 10 seconds per attempt
+
+        try {
+          console.log(`Attempting login method ${i + 1}/${loginAttempts.length}: ${attempt.name}`);
+          const resObj = await fetch(`${cleanUrl}/login`, {
+            method: "POST",
+            headers: attemptHeaders,
+            body: attempt.getBody() as any,
+            redirect: "manual",
+            signal: controller.signal
+          });
+
+          clearTimeout(timeout);
+
+          if (resObj.status === 200 || resObj.status === 302) {
+            console.log(`Login method ${attempt.name} succeeded with status ${resObj.status}!`);
+            loginResponse = resObj;
+            break;
+          } else {
+            console.log(`Login method ${attempt.name} returned status ${resObj.status}`);
+            loginResponse = resObj; // Keep reference to last response
+          }
+        } catch (err: any) {
+          clearTimeout(timeout);
+          lastLoginError = err;
+          console.log(`Login method ${attempt.name} failed with error:`, err.message || err);
+          if (err.name === "AbortError" || err.message?.includes("aborted")) {
+            // timed out, continue to next method
+          }
+        }
+      }
+
+      if (!loginResponse) {
+        const errMessage = lastLoginError?.message || "Connection failed";
+        res.status(502).json({
+          error: `Failed to connect to the panel. Please make sure the IP and port are reachable from the outside.\n\n` +
+                 `خطا در برقراری ارتباط با پنل. لطفاً مطمئن شوید سرور روشن است و پورت پنل روی اینترنت باز می‌باشد.\n\n` +
+                 `Details: ${errMessage}`
+        });
+        return;
+      }
+
+      // Check status
+      if (loginResponse.status !== 200 && loginResponse.status !== 302) {
+        const errorText = await loginResponse.text().catch(() => "");
+        console.log(`Login failed with status ${loginResponse.status}, response:`, errorText);
+        
+        let friendlyMessage = `Login failed with status ${loginResponse.status}`;
+        
+        const isCloudflare = errorText.includes("cloudflare") || errorText.includes("Cloudflare") || errorText.includes("cf-challenge") || errorText.includes("cf-ray");
+        const cleanPathPart = panelUrl.replace(/^https?:\/\//i, ""); // e.g., "1.2.3.4:2053" or "1.2.3.4:2053/path"
+        const hasPath = cleanPathPart.includes("/") && cleanPathPart.substring(cleanPathPart.indexOf("/") + 1).trim().length > 0;
+
+        if (loginResponse.status === 403) {
+          if (isCloudflare) {
+            friendlyMessage = "Forbidden (403): Your 3x-ui panel is behind Cloudflare, and the request was blocked by Cloudflare's Security/WAF. Please disable Cloudflare proxy (set DNS status to 'DNS Only' / gray cloud) or allow Google Cloud IPs in WAF.\n\n" +
+                              "خطای دسترسی (403): پنل شما پشت کلادفلر قرار دارد و درخواست توسط دیوار آتش (WAF) کلادفلر مسدود شده است. لطفاً پروکسی کلادفلر زیردامنه خود را غیرفعال کنید (روی حالت خاکستری یا DNS Only قرار دهید) یا آی‌پی‌های گوگل کلود را در فایروال کلادفلر مجاز کنید.";
+          } else if (!hasPath) {
+            friendlyMessage = "Forbidden (403): Access denied. If your panel has a custom path (Web Base Path) configured in settings, you MUST include it in the URL (e.g., http://your-ip:port/custom-path).\n\n" +
+                              "خطای دسترسی (403): دسترسی مسدود شد. اگر پنل شما دارای «مسیر اختصاصی» (Web Base Path) در تنظیمات است، حتماً باید آن را در انتهای آدرس وارد کنید (مثال: http://your-ip:port/custom-path).";
+          } else {
+            friendlyMessage = "Forbidden (403): Access denied. This is typically caused by: 1) Wrong custom Web Base Path in the URL. 2) A firewall/fail2ban on your server blocking our backend IP. 3) Wrong credentials too many times causing a temp ban.\n\n" +
+                              "خطای دسترسی (403): دسترسی مسدود شد. این خطا معمولاً به دلایل زیر رخ می‌دهد: ۱) اشتباه بودن مسیر اختصاصی (Web Base Path) وارد شده در آدرس. ۲) فایروال یا سیستم امنیتی سرور شما آی‌پی‌های سرور اسکنر را مسدود کرده است. ۳) ورود مکرر اطلاعات اشتباه و مسدود شدن موقت آی‌پی شما توسط پنل.";
+          }
+        } else if (loginResponse.status === 404) {
+          friendlyMessage = `Not Found (404): The login page was not found at ${cleanUrl}/login. Please double-check your Panel URL and ensure your Web Base Path is correct.\n\n` +
+                            `خطای یافت نشد (404): صفحه ورود در این آدرس پیدا نشد. لطفاً آدرس پنل و صحت مسیر اختصاصی (Web Base Path) خود را بررسی کنید.`;
+        } else if (loginResponse.status === 502 || loginResponse.status === 504) {
+          friendlyMessage = `Bad Gateway / Gateway Timeout (${loginResponse.status}): Your panel server is unreachable, offline, or blocking requests.\n\n` +
+                            `خطای دروازه (۵۰۲/۵۰۴): سرور پنل شما در دسترس نیست، خاموش است یا ارتباط را مسدود کرده است.`;
+        } else {
+          friendlyMessage = `Login failed with status ${loginResponse.status}. Please make sure your server is online, URL is correct, and port is open.\n\n` +
+                            `خطا در ورود به پنل با وضعیت ${loginResponse.status}. لطفا مطمئن شوید سرور روشن است، آدرس دقیق است و پورت پنل باز می‌باشد.`;
+        }
+
+        // Add actual server response snippet if available to help users debug
+        const snippet = errorText.trim().replace(/<[^>]*>/g, "").slice(0, 200).trim();
+        if (snippet) {
+          friendlyMessage += `\n\n[Server Response Snippet / خلاصه پاسخ سرور]:\n${snippet}`;
+        }
+
+        res.status(loginResponse.status || 401).json({ error: friendlyMessage });
+        return;
+      }
+
+      // Extract cookies safely
+      const rawCookieHeader = loginResponse.headers.get("set-cookie");
+      const setCookieHeaders = typeof loginResponse.headers.getSetCookie === "function" 
+        ? loginResponse.headers.getSetCookie() 
+        : (rawCookieHeader ? [rawCookieHeader] : []);
+
+      if (setCookieHeaders.length > 0) {
+        cookieString = setCookieHeaders.map(c => c.split(";")[0]).join("; ");
+      } else if (initCookies) {
+        console.log("No new set-cookie header returned, reusing established session cookie from initial GET.");
+        cookieString = initCookies;
+      } else {
+        res.status(401).json({ 
+          error: "No session cookie returned from 3x-ui panel.\n\n" +
+                 "هیچ کوکی نشست (Session Cookie) از پنل دریافت نشد. این موضوع می‌تواند به خاطر اطلاعات ورود نامعتبر یا ناسازگاری موقت با سرور رخ دهد." 
+        });
+        return;
+      }
+    }
+
+    // 3. Register each host
+    const results = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    // We try to find the correct endpoint path. Let's try multiple common paths if one fails with 404
+    let possiblePaths = [
+      "/panel/api/hosts/add",
+      "/panel/api/hosts/addHost",
+      "/panel/api/hosts/add_host",
+      "/panel/api/hosts/add-host",
+      "/panel/api/hosts/addhost",
+      "/api/hosts/add",
+      "/api/hosts/addHost",
+      "/api/hosts/add_host",
+      "/api/hosts/addhost",
+      "/xui/API/hosts/add",
+      "/xui/api/hosts/add",
+      "/xui/api/hosts/addHost",
+      
+      "/panel/api/routing/addHost",
+      "/panel/api/routing/add_host",
+      "/panel/api/routing/add-host",
+      "/panel/api/routing/addhost",
+      "/xui/API/routing/addHost",
+      "/xui/api/routing/addHost",
+      "/api/routing/addHost"
+    ];
+
+    // Dynamically query OpenAPI if possible to find the correct endpoints!
+    try {
+      const openApiHeaders: Record<string, string> = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-Requested-With": "XMLHttpRequest"
+      };
+      if (isBearerAuth) {
+        openApiHeaders["Authorization"] = `Bearer ${apiToken.trim()}`;
+      } else {
+        openApiHeaders["Cookie"] = cookieString;
+      }
+
+      console.log(`Checking OpenAPI endpoint at ${cleanUrl}/panel/api/openapi.json to discover routing/hosts paths...`);
+      const openApiResponse = await fetch(`${cleanUrl}/panel/api/openapi.json`, {
+        method: "GET",
+        headers: openApiHeaders
+      });
+
+      if (openApiResponse.status === 200) {
+        const openApiText = await openApiResponse.text();
+        const isOpenApiHtml = openApiText.trim().startsWith("<") || openApiText.toLowerCase().includes("<html");
+        
+        if (isOpenApiHtml) {
+          console.log("OpenAPI discovery returned HTML (likely redirected or unauthorized). Skipping.");
+        } else {
+          try {
+            const openApiData = JSON.parse(openApiText);
+            if (openApiData && openApiData.paths) {
+              const apiPaths = Object.keys(openApiData.paths);
+              console.log("Discovered panel API paths:", apiPaths);
+              
+              // Filter any path containing 'routing/addHost' or 'hosts/add' or 'host'
+              const discoveredHostsPaths = apiPaths.filter(p => 
+                p.toLowerCase().includes("host") || p.toLowerCase().includes("routing")
+              );
+              
+              if (discoveredHostsPaths.length > 0) {
+                console.log("Discovered potential host/routing paths in OpenAPI:", discoveredHostsPaths);
+                possiblePaths = [...discoveredHostsPaths, ...possiblePaths];
+              }
+            }
+          } catch (jsonErr: any) {
+            console.log("Failed to parse OpenAPI JSON:", jsonErr.message || jsonErr);
+          }
+        }
+      } else {
+        console.log(`OpenAPI check returned status ${openApiResponse.status}`);
+      }
+    } catch (openApiErr: any) {
+      console.log("Failed to inspect OpenAPI endpoint:", openApiErr.message || openApiErr);
+    }
+
+    // Deduplicate possiblePaths while maintaining order
+    possiblePaths = Array.from(new Set(possiblePaths));
+
+    let workingPath = possiblePaths[0];
+
+    // Let's pre-fetch the list of inbounds so we can map host.inbound (tag/name/id) to a numeric inboundId
+    let discoveredInbounds: any[] = [];
+    try {
+      const inboundsPaths = [
+        "/panel/api/inbounds/list",
+        "/xui/API/inbounds/list",
+        "/xui/api/inbounds/list",
+        "/api/inbounds/list"
+      ];
+      const checkHeaders: Record<string, string> = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "X-Requested-With": "XMLHttpRequest"
+      };
+      if (isBearerAuth) {
+        checkHeaders["Authorization"] = `Bearer ${apiToken.trim()}`;
+      } else {
+        checkHeaders["Cookie"] = cookieString;
+      }
+
+      for (const path of inboundsPaths) {
+        let finalUrl = `${cleanUrl}${path}`;
+        try {
+          const parsedClean = new URL(cleanUrl);
+          const basePath = parsedClean.pathname;
+          if (basePath && basePath !== "/" && path.startsWith(basePath)) {
+            finalUrl = `${parsedClean.origin}${path}`;
+          }
+        } catch (e) {}
+
+        try {
+          const checkResponse = await fetch(finalUrl, {
+            method: "GET",
+            headers: checkHeaders
+          });
+          if (checkResponse.status === 200) {
+            const checkText = await checkResponse.text();
+            if (!checkText.trim().startsWith("<")) {
+              const checkJson = JSON.parse(checkText);
+              if (checkJson && checkJson.success && Array.isArray(checkJson.obj)) {
+                discoveredInbounds = checkJson.obj;
+                console.log(`Fetched ${discoveredInbounds.length} inbounds successfully inside sync-hosts for mapping.`);
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+    } catch (e: any) {
+      console.log("Failed to pre-fetch inbounds for mapping:", e.message || e);
+    }
+
+    for (const host of hosts) {
+      let hostSynced = false;
+      let lastError = "";
+      const pathDiagnostics = [];
+
+      // Resolve inboundId (crucial for 3x-ui /hosts/add endpoint!)
+      let inboundId: number | undefined = undefined;
+      
+      // If the frontend already passed host.inboundId, use it!
+      if (host.inboundId !== undefined && host.inboundId !== null && host.inboundId !== "") {
+        inboundId = Number(host.inboundId);
+      }
+      
+      const searchTarget = (host.inbound || "").toString().trim();
+      
+      // If we don't have inboundId yet, try to find it in the discoveredInbounds
+      if (inboundId === undefined && searchTarget && discoveredInbounds.length > 0) {
+        let matched = discoveredInbounds.find(inb => inb.tag && inb.tag.toString().trim() === searchTarget);
+        if (!matched) {
+          matched = discoveredInbounds.find(inb => inb.id && inb.id.toString().trim() === searchTarget);
+        }
+        if (!matched) {
+          matched = discoveredInbounds.find(inb => inb.tag && inb.tag.toString().trim().toLowerCase() === searchTarget.toLowerCase());
+        }
+        if (matched) {
+          inboundId = Number(matched.id);
+          console.log(`Mapped inbound "${searchTarget}" to inboundId ${inboundId}`);
+        }
+      }
+
+      // Fallback: if we still don't have it, and searchTarget is a number, parse it
+      if (inboundId === undefined && /^\d+$/.test(searchTarget)) {
+        inboundId = Number(searchTarget);
+      }
+
+      // Try possible paths in sequence
+      for (const path of possiblePaths) {
+        let addResponse;
+        const addController = new AbortController();
+        const addTimeout = setTimeout(() => addController.abort(), 8000); // 8 seconds per path try
+
+        try {
+          const requestHeaders: Record<string, string> = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "X-Requested-With": "XMLHttpRequest"
+          };
+
+          if (isBearerAuth) {
+            requestHeaders["Authorization"] = `Bearer ${apiToken.trim()}`;
+          } else {
+            requestHeaders["Cookie"] = cookieString;
+          }
+
+          let finalUrl = `${cleanUrl}${path}`;
+          try {
+            const parsedClean = new URL(cleanUrl);
+            const basePath = parsedClean.pathname;
+            if (basePath && basePath !== "/" && path.startsWith(basePath)) {
+              finalUrl = `${parsedClean.origin}${path}`;
+            }
+          } catch (e) {
+            // ignore
+          }
+
+          // Defensive design: Provide fields based on observed UI
+          addResponse = await fetch(finalUrl, {
+            method: "POST",
+            headers: requestHeaders,
+            body: JSON.stringify({
+              remark: host.remark,
+              address: host.endpoint,
+              domain: host.endpoint, // Support both address and domain for structural mapping
+              inbound: host.inbound || "",
+              inboundTag: host.inbound || "", // Support both inbound and inboundTag fields
+              inboundId: inboundId, // Core required field for /panel/api/hosts/add
+              inbound_id: inboundId, // Alternative naming for some database schemas
+              port: Number(host.port) || 443,
+              enable: host.enable !== false,
+              security: host.security || "same"
+            }),
+            signal: addController.signal
+          });
+        } catch (fetchErr: any) {
+          lastError = fetchErr.name === "AbortError" || fetchErr.message?.includes("aborted") 
+            ? "Request timed out (8s)" 
+            : (fetchErr.message || "Network error");
+          
+          pathDiagnostics.push({
+            path,
+            error: lastError
+          });
+          
+          clearTimeout(addTimeout);
+          continue;
+        }
+
+        clearTimeout(addTimeout);
+
+        try {
+          const respText = await addResponse.text();
+          const isHtml = respText.trim().startsWith("<") || respText.toLowerCase().includes("<html");
+          
+          let respJson: any = null;
+          let parseSuccess = false;
+          if (!isHtml) {
+            try {
+              respJson = JSON.parse(respText);
+              parseSuccess = true;
+            } catch (e) {
+              // ignore
+            }
+          }
+
+          pathDiagnostics.push({
+            path,
+            status: addResponse.status,
+            isHtml,
+            parseSuccess,
+            snippet: respText.slice(0, 300).trim()
+          });
+
+          if (addResponse.status === 200) {
+            if (isHtml) {
+              lastError = "Response is an HTML page (likely redirect to login or wrong custom path).";
+            } else if (parseSuccess && respJson && respJson.success === false) {
+              lastError = respJson.msg || "Operation failed in panel";
+            } else if (!parseSuccess) {
+              lastError = "Response is not valid JSON. Expected a JSON success indicator.";
+            } else {
+              hostSynced = true;
+              workingPath = path; // Save the working path
+              break;
+            }
+          } else if (addResponse.status === 404) {
+            lastError = "404 Not Found";
+          } else {
+            lastError = respJson?.msg || `HTTP ${addResponse.status}: ${respText.slice(0, 100)}`;
+          }
+        } catch (err: any) {
+          lastError = err.message || "Parse error";
+          pathDiagnostics.push({
+            path,
+            error: lastError
+          });
+        }
+      }
+
+      if (hostSynced) {
+        successCount++;
+        results.push({ 
+          ip: host.endpoint, 
+          success: true,
+          workingPath,
+          diagnostics: pathDiagnostics
+        });
+      } else {
+        failCount++;
+        results.push({ 
+          ip: host.endpoint, 
+          success: false, 
+          error: lastError,
+          diagnostics: pathDiagnostics 
+        });
+      }
+    }
+
+    const firstFailResult = results.find(r => !r.success);
+    const mostRepresentativeError = firstFailResult ? firstFailResult.error : "Unknown error";
+
+    res.json({
+      success: successCount > 0,
+      total: hosts.length,
+      successCount,
+      failCount,
+      error: successCount === 0 ? mostRepresentativeError : undefined,
+      results
+    });
+
+  } catch (err: any) {
+    console.error("3x-ui sync error:", err);
+    res.status(500).json({ error: err.message || "Internal server error during sync" });
+  }
+});
+
 // Start Server & Integrate Vite Middleware
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
